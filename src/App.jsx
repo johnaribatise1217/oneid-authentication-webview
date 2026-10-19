@@ -5,25 +5,6 @@ import "./app.css";
 
 const appId = import.meta.env.VITE_FACEIO_APP_ID;
 
-const sleep = (milliseconds) =>
-  new Promise((resolve) => window.setTimeout(resolve, milliseconds));
-
-async function waitForFaceIoWidget(timeoutMilliseconds = 12_000) {
-  const startedAt = Date.now();
-
-  while (typeof window.faceIO !== "function") {
-    if (Date.now() - startedAt >= timeoutMilliseconds) {
-      throw new Error("FACEIO_WIDGET_TIMEOUT");
-    }
-
-    await sleep(50);
-  }
-
-  // fio.js has loaded. Give the npm wrapper's load handler a moment to create
-  // its internal client before authenticate() is called.
-  await sleep(100);
-}
-
 function errorMessage(errorCode, faceio) {
   const codes = faceio.fetchAllErrorCodes();
 
@@ -42,6 +23,7 @@ function errorMessage(errorCode, faceio) {
       codes.PAD_ATTACK,
       "Face verification could not confirm a live person. Please try again.",
     ],
+    [codes.FACE_MISMATCH, "The camera frames did not match. Please try again."],
     [codes.WRONG_PIN_CODE, "The FaceIO PIN entered was incorrect."],
     [
       codes.PROCESSING_ERR,
@@ -84,17 +66,60 @@ function errorMessage(errorCode, faceio) {
   );
 }
 
-function startupErrorMessage(error) {
-  if (error?.message === "FACEIO_WIDGET_TIMEOUT") {
-    return "FaceIO could not start. Check the connection and try again.";
+function cameraErrorMessage(error) {
+  if (error?.message === "INSECURE_CONTEXT") {
+    return "Camera access requires the verification page to use HTTPS.";
   }
 
-  return "Face verification could not be started. Please try again.";
+  if (error?.message === "CAMERA_API_UNAVAILABLE") {
+    return "This WebView does not support browser camera access.";
+  }
+
+  switch (error?.name) {
+    case "NotAllowedError":
+      return "Camera permission was denied for the verification page.";
+
+    case "NotFoundError":
+      return "No usable front camera was found.";
+
+    case "NotReadableError":
+      return "The camera is busy. Close other camera screens and try again.";
+
+    case "OverconstrainedError":
+      return "The requested camera is not available on this device.";
+
+    default:
+      return "Camera access could not be started. Please try again.";
+  }
+}
+
+async function confirmFrontCameraAccess() {
+  if (!window.isSecureContext) {
+    throw new Error("INSECURE_CONTEXT");
+  }
+
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error("CAMERA_API_UNAVAILABLE");
+  }
+
+  let stream;
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: "user" },
+      },
+      audio: false,
+    });
+  } finally {
+    stream?.getTracks().forEach((track) => track.stop());
+  }
 }
 
 export default function App() {
   const faceioRef = useRef(null);
-  const startAttemptedRef = useRef(false);
+  const inProgressRef = useRef(false);
+
   const [phase, setPhase] = useState("starting");
   const [error, setError] = useState(null);
 
@@ -102,71 +127,101 @@ export default function App() {
     if (!appId) {
       setError("FaceIO is not configured for this environment.");
       setPhase("failed");
-      return undefined;
+      return;
     }
 
-    faceioRef.current = new faceIO(appId);
-    let cancelled = false;
+    try {
+      faceioRef.current = new faceIO(appId);
+      setPhase("ready");
 
-    async function beginAuthentication() {
-      if (startAttemptedRef.current) return;
-      startAttemptedRef.current = true;
+      sendToNative({
+        type: "FACEIO_AUTHENTICATION_WEB_READY",
+      });
+    } catch (initializationError) {
+      console.error("FACEIO initialization failed:", initializationError);
 
-      try {
-        await waitForFaceIoWidget();
-
-        if (cancelled) return;
-
-        setPhase("authenticating");
-
-        // No email or whoami is supplied here. FaceIO returns the payload that
-        // was saved during enrollment, including email and whoami.
-        const userData = await faceioRef.current.authenticate({
-          locale: "auto",
-        });
-
-        if (cancelled) return;
-
-        setPhase("completed");
-        sendToNative({
-          type: "FACEIO_AUTHENTICATION_COMPLETED",
-          succeed: true,
-          data: userData,
-          message: "Face authenticated successfully.",
-        });
-      } catch (errorCode) {
-        if (cancelled) return;
-
-        const message =
-          typeof errorCode === "number"
-            ? errorMessage(errorCode, faceioRef.current)
-            : startupErrorMessage(errorCode);
-
-        setError(message);
-        setPhase("failed");
-        sendToNative({
-          type: "FACEIO_AUTHENTICATION_FAILED",
-          succeed: false,
-          data: null,
-          message,
-        });
-      }
+      setError("Face verification could not be initialized.");
+      setPhase("failed");
     }
-
-    beginAuthentication();
-
-    return () => {
-      cancelled = true;
-    };
   }, []);
 
+  async function startAuthentication() {
+    if (!faceioRef.current || inProgressRef.current) {
+      return;
+    }
+
+    inProgressRef.current = true;
+    setError(null);
+    setPhase("authenticating");
+
+    // Check camera access before starting FACEIO.
+    // This matches our working enrollment implementation.
+    try {
+      await confirmFrontCameraAccess();
+    } catch (cameraError) {
+      console.error("Authentication camera preflight failed:", cameraError);
+
+      const message = cameraErrorMessage(cameraError);
+
+      setError(message);
+      setPhase("failed");
+      inProgressRef.current = false;
+
+      sendToNative({
+        type: "FACEIO_AUTHENTICATION_FAILED",
+        succeed: false,
+        data: null,
+        message,
+      });
+
+      return;
+    }
+
+    try {
+      // No email or whoami is supplied here.
+      // FACEIO returns the payload stored during enrollment.
+      const userData = await faceioRef.current.authenticate({
+        locale: "auto",
+      });
+
+      setPhase("completed");
+
+      sendToNative({
+        type: "FACEIO_AUTHENTICATION_COMPLETED",
+        succeed: true,
+        data: userData,
+        message: "Face authenticated successfully.",
+      });
+    } catch (errorCode) {
+      console.error("FACEIO authentication failed:", errorCode);
+
+      const message =
+        typeof errorCode === "number"
+          ? errorMessage(errorCode, faceioRef.current)
+          : "Face verification could not be started. Please try again.";
+
+      setError(message);
+      setPhase("failed");
+
+      sendToNative({
+        type: "FACEIO_AUTHENTICATION_FAILED",
+        succeed: false,
+        data: null,
+        message,
+      });
+    } finally {
+      inProgressRef.current = false;
+    }
+  }
+
   function tryAgain() {
-    // Start with a clean FACEIO page/session after a failed or aborted attempt.
+    // Reload to reset FACEIO's internal widget/session state.
     window.location.reload();
   }
 
-  // Once authenticate() starts, the FACEIO widget owns the camera, liveness,
-  // and PIN experience. Do not add another getUserMedia preflight here.
+  // Once authentication starts, FACEIO owns the visual experience.
+  // Hide our React card so its camera, liveness and PIN screens
+  // remain unobstructed.
   if (phase === "authenticating") {
     return <main className="faceio-stage" aria-busy="true" />;
   }
@@ -175,12 +230,27 @@ export default function App() {
     <main className="page-shell">
       <section className="authentication-card" aria-live="polite">
         <span className="eyebrow">ONEID</span>
+
         <h1>Confirm Face ID</h1>
 
         {phase === "starting" && (
           <>
             <div className="spinner" aria-hidden="true" />
+
             <p>Preparing secure face verification...</p>
+          </>
+        )}
+
+        {phase === "ready" && (
+          <>
+            <p>
+              Verify your identity using your enrolled face. You may also be
+              asked to enter your FaceIO PIN.
+            </p>
+
+            <button type="button" onClick={startAuthentication}>
+              Start face verification
+            </button>
           </>
         )}
 
@@ -189,7 +259,10 @@ export default function App() {
         {phase === "failed" && (
           <>
             <p className="error">{error}</p>
-            <button onClick={tryAgain}>Try again</button>
+
+            <button type="button" onClick={tryAgain}>
+              Try again
+            </button>
           </>
         )}
       </section>
