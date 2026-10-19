@@ -120,66 +120,28 @@ export default function App() {
   const faceioRef = useRef(null);
   const inProgressRef = useRef(false);
 
-  const [phase, setPhase] = useState("starting");
-  const [error, setError] = useState(null);
+  const [phase, setPhase] = useState(appId ? "ready" : "failed");
 
-  useEffect(() => {
-    if (!appId) {
-      setError("FaceIO is not configured for this environment.");
-      setPhase("failed");
-      return;
-    }
-
-    try {
-      faceioRef.current = new faceIO(appId);
-      setPhase("ready");
-
-      sendToNative({
-        type: "FACEIO_AUTHENTICATION_WEB_READY",
-      });
-    } catch (initializationError) {
-      console.error("FACEIO initialization failed:", initializationError);
-
-      setError("Face verification could not be initialized.");
-      setPhase("failed");
-    }
-  }, []);
+  const [error, setError] = useState(
+    appId ? null : "FaceIO is not configured for this environment.",
+  );
 
   async function startAuthentication() {
-    if (!faceioRef.current || inProgressRef.current) {
-      return;
-    }
+    if (inProgressRef.current) return;
 
     inProgressRef.current = true;
     setError(null);
     setPhase("authenticating");
 
-    // Check camera access before starting FACEIO.
-    // This matches our working enrollment implementation.
     try {
+      // Check camera access first, as in our enrollment app.
       await confirmFrontCameraAccess();
-    } catch (cameraError) {
-      console.error("Authentication camera preflight failed:", cameraError);
 
-      const message = cameraErrorMessage(cameraError);
+      // Initialize FACEIO only after user interaction.
+      if (!faceioRef.current) {
+        faceioRef.current = new faceIO(appId);
+      }
 
-      setError(message);
-      setPhase("failed");
-      inProgressRef.current = false;
-
-      sendToNative({
-        type: "FACEIO_AUTHENTICATION_FAILED",
-        succeed: false,
-        data: null,
-        message,
-      });
-
-      return;
-    }
-
-    try {
-      // No email or whoami is supplied here.
-      // FACEIO returns the payload stored during enrollment.
       const userData = await faceioRef.current.authenticate({
         locale: "auto",
       });
@@ -193,12 +155,14 @@ export default function App() {
         message: "Face authenticated successfully.",
       });
     } catch (errorCode) {
-      console.error("FACEIO authentication failed:", errorCode);
+      console.error("Authentication error:", errorCode);
 
       const message =
-        typeof errorCode === "number"
+        typeof errorCode === "number" && faceioRef.current
           ? errorMessage(errorCode, faceioRef.current)
-          : "Face verification could not be started. Please try again.";
+          : errorCode?.name || errorCode?.message
+            ? cameraErrorMessage(errorCode)
+            : "Face verification could not be started. Please try again.";
 
       setError(message);
       setPhase("failed");
@@ -215,13 +179,9 @@ export default function App() {
   }
 
   function tryAgain() {
-    // Reload to reset FACEIO's internal widget/session state.
     window.location.reload();
   }
 
-  // Once authentication starts, FACEIO owns the visual experience.
-  // Hide our React card so its camera, liveness and PIN screens
-  // remain unobstructed.
   if (phase === "authenticating") {
     return <main className="faceio-stage" aria-busy="true" />;
   }
@@ -230,26 +190,13 @@ export default function App() {
     <main className="page-shell">
       <section className="authentication-card" aria-live="polite">
         <span className="eyebrow">ONEID</span>
-
         <h1>Confirm Face ID</h1>
-
-        {phase === "starting" && (
-          <>
-            <div className="spinner" aria-hidden="true" />
-
-            <p>Preparing secure face verification...</p>
-          </>
-        )}
 
         {phase === "ready" && (
           <>
-            <p>
-              Verify your identity using your enrolled face. You may also be
-              asked to enter your FaceIO PIN.
-            </p>
-
-            <button type="button" onClick={startAuthentication}>
-              Start face verification
+            <p>Verify your identity using your enrolled face.</p>
+            <button onClick={startAuthentication}>
+              Start Face ID Authentication
             </button>
           </>
         )}
@@ -259,10 +206,7 @@ export default function App() {
         {phase === "failed" && (
           <>
             <p className="error">{error}</p>
-
-            <button type="button" onClick={tryAgain}>
-              Try again
-            </button>
+            {appId && <button onClick={tryAgain}>Try again</button>}
           </>
         )}
       </section>
