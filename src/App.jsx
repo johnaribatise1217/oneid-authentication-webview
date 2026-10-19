@@ -3,7 +3,7 @@ import faceIO from "@faceio/fiojs";
 import { sendToNative } from "./messages";
 import "./app.css";
 
-const appId = import.meta.env.FACEIO_APP_ID;
+const appId = import.meta.env.VITE_FACEIO_APP_ID;
 
 const sleep = (milliseconds) =>
   new Promise((resolve) => window.setTimeout(resolve, milliseconds));
