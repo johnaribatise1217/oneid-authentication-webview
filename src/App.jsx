@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import faceIO from "@faceio/fiojs";
 import { sendToNative } from "./messages";
 import "./app.css";
@@ -23,7 +23,6 @@ function errorMessage(errorCode, faceio) {
       codes.PAD_ATTACK,
       "Face verification could not confirm a live person. Please try again.",
     ],
-    [codes.FACE_MISMATCH, "The camera frames did not match. Please try again."],
     [codes.WRONG_PIN_CODE, "The FaceIO PIN entered was incorrect."],
     [
       codes.PROCESSING_ERR,
@@ -34,18 +33,11 @@ function errorMessage(errorCode, faceio) {
       "Face verification is not authorised for this application.",
     ],
     [
-      codes.TERMS_NOT_ACCEPTED,
-      "Face verification was cancelled because consent was not accepted.",
-    ],
-    [
       codes.SESSION_EXPIRED,
       "The face verification session expired. Please try again.",
     ],
     [codes.TIMEOUT, "Face verification timed out. Please try again."],
-    [
-      codes.TOO_MANY_REQUESTS,
-      "Too many face verification attempts. Please wait and try again.",
-    ],
+    [codes.TOO_MANY_REQUESTS, "Too many attempts. Please wait and try again."],
     [codes.EMPTY_ORIGIN, "The verification page has no valid origin."],
     [
       codes.FORBIDDEN_ORIGIN,
@@ -54,10 +46,14 @@ function errorMessage(errorCode, faceio) {
     [codes.FORBIDDEN_COUNTRY, "FaceIO is not available from this location."],
     [
       codes.SESSION_IN_PROGRESS,
-      "A face verification session is already in progress.",
+      "A verification session is already in progress.",
     ],
     [codes.ABORTED_BY_USER, "Face verification was cancelled."],
     [codes.NETWORK_IO, "A network error occurred while connecting to FaceIO."],
+    [
+      codes.UI_NOT_READY,
+      "Face verification is still initializing. Please try again.",
+    ],
   ]);
 
   return (
@@ -70,35 +66,51 @@ export default function App() {
   const faceioRef = useRef(null);
   const inProgressRef = useRef(false);
 
-  const [phase, setPhase] = useState(appId ? "ready" : "failed");
+  const [phase, setPhase] = useState("starting");
+  const [error, setError] = useState(null);
 
-  const [error, setError] = useState(
-    appId ? null : "FaceIO is not configured for this environment.",
-  );
+  useEffect(() => {
+    if (!appId) {
+      setError("FaceIO is not configured for this environment.");
+      setPhase("failed");
+      return;
+    }
+
+    try {
+      // Same initialization pattern as our working enrollment app.
+      faceioRef.current = new faceIO(appId);
+
+      setPhase("ready");
+
+      sendToNative({
+        type: "FACEIO_AUTHENTICATION_WEB_READY",
+      });
+    } catch (initializationError) {
+      console.error("[FACEIO] Initialization error:", initializationError);
+
+      setError("Face verification could not be initialized.");
+      setPhase("failed");
+    }
+  }, []);
 
   async function startAuthentication() {
-    if (inProgressRef.current || !appId) return;
+    if (!faceioRef.current || inProgressRef.current) {
+      return;
+    }
 
     inProgressRef.current = true;
     setError(null);
     setPhase("authenticating");
 
     try {
-      // Initialize FACEIO only after the user clicks the button.
-      // Do not run a separate getUserMedia camera pre-check.
-      if (!faceioRef.current) {
-        faceioRef.current = new faceIO(appId);
-      }
-
-      // FACEIO handles camera access, liveness, recognition
-      // and PIN verification internally.
+      // No manual getUserMedia() pre-check.
+      // FACEIO handles camera access itself.
       const userData = await faceioRef.current.authenticate({
         locale: "auto",
       });
 
       setPhase("completed");
 
-      // Send successful authentication data to React Native.
       sendToNative({
         type: "FACEIO_AUTHENTICATION_COMPLETED",
         succeed: true,
@@ -106,12 +118,26 @@ export default function App() {
         message: "Face authenticated successfully.",
       });
     } catch (errorCode) {
-      console.error("FACEIO authentication failed:", errorCode);
+      console.error("[FACEIO] Authentication rejected:", {
+        code: errorCode,
+        type: typeof errorCode,
+        message: errorCode?.message,
+      });
+
+      const normalizedCode =
+        typeof errorCode === "number"
+          ? errorCode
+          : typeof errorCode === "string" &&
+              errorCode.trim() !== "" &&
+              Number.isFinite(Number(errorCode))
+            ? Number(errorCode)
+            : null;
 
       const message =
-        typeof errorCode === "number" && faceioRef.current
-          ? errorMessage(errorCode, faceioRef.current)
-          : "Face verification could not be started. Please try again.";
+        normalizedCode !== null
+          ? errorMessage(normalizedCode, faceioRef.current)
+          : errorCode?.message ||
+            "Face verification could not be started. Please try again.";
 
       setError(message);
       setPhase("failed");
@@ -128,11 +154,11 @@ export default function App() {
   }
 
   function tryAgain() {
-    // Reload to reset FACEIO's internal widget/session state.
+    // Reset the widget and its session.
     window.location.reload();
   }
 
-  // FACEIO owns the visual experience during authentication.
+  // Once authentication begins, FACEIO owns the screen.
   if (phase === "authenticating") {
     return <main className="faceio-stage" aria-busy="true" />;
   }
@@ -141,8 +167,14 @@ export default function App() {
     <main className="page-shell">
       <section className="authentication-card" aria-live="polite">
         <span className="eyebrow">ONEID</span>
-
         <h1>Confirm Face ID</h1>
+
+        {phase === "starting" && (
+          <>
+            <div className="spinner" aria-hidden="true" />
+            <p>Preparing secure face verification...</p>
+          </>
+        )}
 
         {phase === "ready" && (
           <>
